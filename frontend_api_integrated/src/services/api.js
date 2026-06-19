@@ -53,6 +53,7 @@ export const authApi = {
 
 export const businessesApi = {
   list: () => api.get('/businesses/'),
+  mine: () => api.get('/businesses/mine'),
   get: (id) => api.get(`/businesses/${id}`),
   create: (payload) => api.post('/businesses/', payload),
   update: (id, payload) => api.put(`/businesses/${id}`, payload),
@@ -88,8 +89,9 @@ export const appointmentsApi = {
 };
 
 export const paymentsApi = {
-  checkout: (payload) => api.post('/payments/checkout-session', payload),
-  status: (appointmentId) => api.get(`/payments/appointments/${appointmentId}/status`),
+  checkout: (payload, params) => api.post('/payments/checkout', payload, { params }),
+  get: (appointmentId) => api.get(`/payments/${appointmentId}`),
+  status: (appointmentId) => api.get(`/payments/${appointmentId}/status`),
 };
 
 export default api;

@@ -1,0 +1,15 @@
+.git
+.sixth
+venv
+env
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+node_modules
+easy-bookings/node_modules
+easy-bookings/dist
+dump.rdb
+*.log
+.env

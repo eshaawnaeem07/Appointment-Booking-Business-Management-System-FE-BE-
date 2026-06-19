@@ -1,14 +1,16 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Calendar, Clock, Building2, LogOut, Plus, RefreshCw, Trash2, Check, Eye, Mail, Pencil, Phone, Save, UserRound, X } from 'lucide-react';
-import { appointmentsApi, authApi, businessesApi, servicesApi } from './services/api';
+import { Calendar, Clock, Building2, LogOut, Plus, RefreshCw, Trash2, Check, Eye, Mail, Pencil, Phone, Save, UserRound, X, CreditCard, Receipt, ExternalLink } from 'lucide-react';
+import { appointmentsApi, authApi, businessesApi, servicesApi, paymentsApi } from './services/api';
 
 type User = { email: string; role: string };
 type Business = { id: string; name: string; description?: string; owner_id?: string };
 type Service = { id: string; business_id: string; name: string; description?: string; duration: number; price: number; requires_deposit: boolean };
-type Appointment = { id: string; business_id: string; service_id: string; start_time: string; end_time: string; status: string };
+type Appointment = { id: string; business_id: string; service_id: string; start_time: string; end_time: string; status: string; user?: { email?: string | null } | null; walk_in_customer?: { name?: string | null } | null };
+type PaymentRecord = { id?: string; appointment_id: string; status: string; amount: number; created_at?: string; updated_at?: string; stripe_session_id?: string | null; stripe_payment_intent?: string | null };
 type BusinessHour = { id?: string; day_of_week: string; is_open: boolean; open_time: string; close_time: string };
 type AvailableDay = { date: string; available_slots: string[] };
 type BusinessCustomer = { id: string; business_id: string; user_id?: string | null; name: string; phone: string; email?: string | null; created_at: string };
+type ToastState = { type: 'success' | 'error'; text: string } | null;
 
 const decodeUser = (token: string, fallbackEmail = ''): User => {
   try {
@@ -20,9 +22,15 @@ const decodeUser = (token: string, fallbackEmail = ''): User => {
 };
 
 const money = (value: number) => new Intl.NumberFormat(undefined, { style: 'currency', currency: 'USD' }).format(Number(value || 0));
+const centsToMoney = (value: number) => money(Number(value || 0) / 100);
 const formatDateTime = (value: string) => value ? new Date(value).toLocaleString() : '-';
 const formatDate = (value: string) => value ? new Date(value).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }) : '-';
 const formatTime = (value: string) => value ? new Date(value).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }) : '-';
+const toDateTimeLocalValue = (value: string) => {
+  const date = new Date(value);
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
+  return local.toISOString().slice(0, 16);
+};
 
 function Card({ children, className = '' }: { children: React.ReactNode; className?: string }) {
   return <div className={`rounded-2xl border border-slate-200 bg-white p-5 shadow-sm ${className}`}>{children}</div>;
@@ -69,6 +77,7 @@ export default function App() {
   const [businessHours, setBusinessHours] = useState<BusinessHour[]>(defaultHours);
   const [serviceNamesById, setServiceNamesById] = useState<Record<string, string>>({});
   const [message, setMessage] = useState('');
+  const [toast, setToast] = useState<ToastState>(null);
   const [loading, setLoading] = useState(false);
   const [businessForm, setBusinessForm] = useState({ name: '', description: '' });
   const [serviceForm, setServiceForm] = useState({ name: '', description: '', duration: '30', price: '0', requires_deposit: false });
@@ -76,36 +85,40 @@ export default function App() {
   const [customerForm, setCustomerForm] = useState(emptyCustomerForm);
   const [editingCustomerId, setEditingCustomerId] = useState('');
   const [selectedCustomer, setSelectedCustomer] = useState<BusinessCustomer | null>(null);
-  const [bookingForm, setBookingForm] = useState({ service_id: '', start_time: '' });
+  const [bookingForm, setBookingForm] = useState({ service_id: '', start_time: '', walk_in_customer_id: '' });
   const [availableDays, setAvailableDays] = useState<AvailableDay[]>([]);
   const [slotsLoading, setSlotsLoading] = useState(false);
   const [selectedAppointment, setSelectedAppointment] = useState<any>(null);
   const [showAppointmentModal, setShowAppointmentModal] = useState(false);
+  const [isEditingAppointment, setIsEditingAppointment] = useState(false);
+  const [appointmentUpdateForm, setAppointmentUpdateForm] = useState({ start_time: '' });
+  const [appointmentAvailableDays, setAppointmentAvailableDays] = useState<AvailableDay[]>([]);
+  const [appointmentSlotsLoading, setAppointmentSlotsLoading] = useState(false);
+  const [paymentsByAppointment, setPaymentsByAppointment] = useState<Record<string, PaymentRecord | null>>({});
+  const [paymentLoadingId, setPaymentLoadingId] = useState('');
+  const [checkoutLink, setCheckoutLink] = useState('');
 
   const isBusinessUser = user?.role === 'business';
   const selectedBusiness = useMemo(() => businesses.find((b) => b.id === selectedBusinessId), [businesses, selectedBusinessId]);
+  const paymentRoute = window.location.pathname === '/payment/success' || window.location.pathname === '/payment/cancel' ? window.location.pathname : '';
   const getServiceName = (serviceId: string) => serviceNamesById[serviceId] || services.find((service) => service.id === serviceId)?.name || 'Service unavailable';
   const getBusinessName = (businessId: string) => businesses.find((business) => business.id === businessId)?.name || 'Business unavailable';
   const getAppointmentUserName = (appointment: any) => appointment.walk_in_customer?.name || appointment.user?.email || appointment.user_name || appointment.customer_name || appointment.user_id || '-';
 
-  const showError = (error: any) => setMessage(error?.response?.data?.detail || error?.message || 'Something went wrong');
+  const showSuccess = (text: string) => {
+    setMessage(text);
+    setToast({ type: 'success', text });
+  };
+
+  const showError = (error: any) => {
+    const text = error?.response?.data?.detail || (error?.message === 'Network Error' ? 'Cannot reach backend API. Check that FastAPI is running and CORS allows this frontend.' : error?.message) || 'Something went wrong';
+    setMessage(text);
+    setToast({ type: 'error', text });
+  };
 
   const loadBusinesses = async () => {
-    const { data } = await businessesApi.list();
-    let visibleBusinesses = data || [];
-
-    if (isBusinessUser) {
-      const ownershipChecks = await Promise.allSettled(
-        visibleBusinesses.map(async (business: Business) => {
-          await businessesApi.appointments(business.id);
-          return business;
-        })
-      );
-
-      visibleBusinesses = ownershipChecks
-        .filter((result): result is PromiseFulfilledResult<Business> => result.status === 'fulfilled')
-        .map((result) => result.value);
-    }
+    const { data } = isBusinessUser ? await businessesApi.mine() : await businessesApi.list();
+    const visibleBusinesses = data || [];
 
     setBusinesses(visibleBusinesses);
     setSelectedBusinessId((current) => visibleBusinesses.some((business: Business) => business.id === current) ? current : visibleBusinesses?.[0]?.id || '');
@@ -164,17 +177,83 @@ export default function App() {
     }));
   };
 
+  const loadPaymentStatus = async (appointmentId: string) => {
+    try {
+      const { data } = await paymentsApi.status(appointmentId);
+      setPaymentsByAppointment((current) => ({ ...current, [appointmentId]: data }));
+      return data;
+    } catch (error: any) {
+      if (error?.response?.status === 404) {
+        setPaymentsByAppointment((current) => ({ ...current, [appointmentId]: null }));
+        return null;
+      }
+
+      throw error;
+    }
+  };
+
+  const loadPaymentRecord = async (appointmentId: string) => {
+    try {
+      const { data } = await paymentsApi.get(appointmentId);
+      setPaymentsByAppointment((current) => ({ ...current, [appointmentId]: data }));
+      return data;
+    } catch (error: any) {
+      if (error?.response?.status === 404) {
+        setPaymentsByAppointment((current) => ({ ...current, [appointmentId]: null }));
+        return null;
+      }
+
+      throw error;
+    }
+  };
+
+  const refreshPaymentStatuses = async (appointmentRows: Appointment[]) => {
+    const payableAppointments = appointmentRows;
+    if (!payableAppointments.length) return;
+
+    await Promise.allSettled(payableAppointments.map((appointment) => loadPaymentStatus(appointment.id)));
+  };
+
   const viewAppointment = async (appointmentId: string) => {
     try {
       setLoading(true);
+      setCheckoutLink('');
+      setIsEditingAppointment(false);
       const { data } = await appointmentsApi.get(appointmentId);
       setSelectedAppointment(data);
+      loadPaymentRecord(data.id).catch(() => {});
       setShowAppointmentModal(true);
     } catch (error) {
       showError(error);
     } finally {
       setLoading(false);
     }
+  };
+
+  const editAppointment = async (appointmentId: string) => {
+    try {
+      setLoading(true);
+      setCheckoutLink('');
+      const { data } = await appointmentsApi.get(appointmentId);
+      setSelectedAppointment(data);
+      setAppointmentUpdateForm({ start_time: toDateTimeLocalValue(data.start_time) });
+      setAppointmentAvailableDays([]);
+      setIsEditingAppointment(true);
+      setShowAppointmentModal(true);
+      loadPaymentRecord(data.id).catch(() => {});
+    } catch (error) {
+      showError(error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const closeAppointmentModal = () => {
+    setShowAppointmentModal(false);
+    setSelectedAppointment(null);
+    setIsEditingAppointment(false);
+    setAppointmentUpdateForm({ start_time: '' });
+    setAppointmentAvailableDays([]);
   };
 
   const refreshAll = async () => {
@@ -190,6 +269,11 @@ export default function App() {
   };
 
   useEffect(() => { if (user) refreshAll(); }, [user]);
+  useEffect(() => {
+    if (!toast) return;
+    const timeoutId = window.setTimeout(() => setToast(null), 3500);
+    return () => window.clearTimeout(timeoutId);
+  }, [toast]);
   useEffect(() => {
     if (selectedBusinessId) {
       loadServices(selectedBusinessId).catch(showError);
@@ -207,7 +291,7 @@ export default function App() {
     setCustomerForm(emptyCustomerForm);
     setBusinessHours(defaultHours());
     setAvailableDays([]);
-    setBookingForm({ service_id: '', start_time: '' });
+    setBookingForm({ service_id: '', start_time: '', walk_in_customer_id: '' });
   }, [selectedBusinessId, isBusinessUser]);
   useEffect(() => {
     if (!services.length) return;
@@ -243,6 +327,18 @@ export default function App() {
 
     return () => { isMounted = false; };
   }, [appointments, businessAppointments, serviceNamesById]);
+  useEffect(() => {
+    if (!appointments.length) return;
+    refreshPaymentStatuses(appointments).catch(() => {});
+  }, [appointments, services]);
+  useEffect(() => {
+    if (!user || !paymentRoute) return;
+
+    const appointmentId = new URLSearchParams(window.location.search).get('appointment_id');
+    if (!appointmentId) return;
+
+    loadPaymentStatus(appointmentId).catch(showError);
+  }, [user, paymentRoute]);
 
   const submitAuth = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -252,7 +348,8 @@ export default function App() {
       if (authMode === 'register') {
         await authApi.register(authForm);
         setAuthMode('login');
-        setMessage('Account created. Please login now.');
+        setAuthForm((current) => ({ ...current, password: '' }));
+        showSuccess('Account created successfully. Please login now.');
         return;
       }
       const { data } = await authApi.login({ email: authForm.email, password: authForm.password });
@@ -261,6 +358,7 @@ export default function App() {
       const userData = decodeUser(data.access_token, authForm.email);
       localStorage.setItem('user', JSON.stringify(userData));
       setUser(userData);
+      showSuccess('Logged in successfully.');
     } catch (error) {
       showError(error);
     } finally {
@@ -435,24 +533,103 @@ export default function App() {
     event.preventDefault();
     try {
       setLoading(true);
-      await appointmentsApi.create({ service_id: bookingForm.service_id, start_time: bookingForm.start_time });
+      setCheckoutLink('');
+      const payload: any = {
+        service_id: bookingForm.service_id,
+        start_time: bookingForm.start_time,
+      };
+
+      if (isBusinessUser && bookingForm.walk_in_customer_id) {
+        payload.walk_in_customer_id = bookingForm.walk_in_customer_id;
+      }
+
+      const { data } = await appointmentsApi.create(payload);
       await loadMyAppointments();
       await loadBusinessAppointments(selectedBusinessId);
-      setMessage('Appointment booked successfully.');
+      const service = services.find((item) => item.id === bookingForm.service_id);
+      if (service?.requires_deposit) {
+        setSelectedAppointment(data);
+        setShowAppointmentModal(true);
+        if (isBusinessUser && bookingForm.walk_in_customer_id) {
+          const checkout = await createCheckoutSession(data);
+          setMessage(checkout?.checkout_url ? 'Appointment booked. Stripe payment link was emailed to the customer.' : 'Appointment booked. Create checkout from the appointment actions.');
+        } else {
+          setMessage('Appointment booked. Complete checkout to confirm it.');
+        }
+      } else {
+        setMessage('Appointment booked successfully.');
+      }
     } catch (error) { showError(error); } finally { setLoading(false); }
   };
 
-  const loadAvailableSlots = async () => {
-    if (!bookingForm.service_id) {
+  const createCheckoutSession = async (appointment: Appointment | any) => {
+    const origin = window.location.origin;
+    const { data } = await paymentsApi.checkout(
+      { appointment_id: appointment.id },
+      {
+        success_url: `${origin}/payment/success?appointment_id=${appointment.id}`,
+        cancel_url: `${origin}/payment/cancel?appointment_id=${appointment.id}`,
+      }
+    );
+
+    await loadPaymentStatus(appointment.id).catch(() => {});
+    setCheckoutLink(data?.checkout_url || '');
+    return data;
+  };
+
+  const startCheckout = async (appointment: Appointment | any, redirectToStripe = true) => {
+    try {
+      setPaymentLoadingId(appointment.id);
+      setMessage('');
+      const data = await createCheckoutSession(appointment);
+
+      if (data?.checkout_url && redirectToStripe) {
+        window.location.href = data.checkout_url;
+        return;
+      }
+
+      setMessage(data?.checkout_url ? 'Stripe payment link created and emailed to the customer.' : 'Checkout session created, but Stripe did not return a checkout URL.');
+    } catch (error) {
+      showError(error);
+    } finally {
+      setPaymentLoadingId('');
+    }
+  };
+
+  const returnFromPaymentPage = () => {
+    window.history.pushState({}, '', '/');
+    window.location.reload();
+  };
+
+  const loadAvailableSlots = async (
+    serviceId?: string,
+    selectedDate?: string,
+    target: 'booking' | 'appointment' = 'booking'
+  ) => {
+    const activeServiceId = serviceId || bookingForm.service_id;
+    if (!activeServiceId) {
       setMessage('Select a service first.');
       return;
     }
 
     try {
-      setSlotsLoading(true);
+      if (target === 'appointment') {
+        setAppointmentSlotsLoading(true);
+      } else {
+        setSlotsLoading(true);
+      }
       setMessage('');
-      const selectedDate = bookingForm.start_time ? bookingForm.start_time.slice(0, 10) : undefined;
-      const { data } = await servicesApi.availableSlots(bookingForm.service_id, selectedDate);
+      const effectiveSelectedDate =
+        selectedDate ||
+        (target === 'booking'
+          ? bookingForm.start_time
+            ? bookingForm.start_time.slice(0, 10)
+            : undefined
+          : appointmentUpdateForm.start_time
+            ? appointmentUpdateForm.start_time.slice(0, 10)
+            : undefined);
+
+      const { data } = await servicesApi.availableSlots(activeServiceId, effectiveSelectedDate);
       const now = new Date();
       const futureDays = (data?.days || [])
         .map((day: AvailableDay) => ({
@@ -460,17 +637,30 @@ export default function App() {
           available_slots: day.available_slots.filter((slot) => new Date(slot) > now),
         }))
         .filter((day: AvailableDay) => day.available_slots.length > 0);
-      setAvailableDays(futureDays);
+      if (target === 'appointment') {
+        setAppointmentAvailableDays(futureDays);
+      } else {
+        setAvailableDays(futureDays);
+      }
     } catch (error) {
       showError(error);
     } finally {
-      setSlotsLoading(false);
+      if (target === 'appointment') {
+        setAppointmentSlotsLoading(false);
+      } else {
+        setSlotsLoading(false);
+      }
     }
   };
 
   const selectSlot = (slot: string) => {
     const localValue = slot.slice(0, 16);
     setBookingForm((current) => ({ ...current, start_time: localValue }));
+  };
+
+  const selectAppointmentSlot = (slot: string) => {
+    const localValue = slot.slice(0, 16);
+    setAppointmentUpdateForm({ start_time: localValue });
   };
 
   const updateAppointmentStatus = async (id: string, action: 'confirm' | 'complete' | 'noShow') => {
@@ -498,9 +688,54 @@ export default function App() {
     }
   };
 
+  const saveAppointmentUpdate = async (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!selectedAppointment) return;
+
+    try {
+      setLoading(true);
+      const { data } = await appointmentsApi.reschedule(selectedAppointment.id, {
+        start_time: appointmentUpdateForm.start_time,
+      });
+
+      setSelectedAppointment(data);
+      setAppointmentUpdateForm({ start_time: toDateTimeLocalValue(data.start_time) });
+      setIsEditingAppointment(false);
+      setShowAppointmentModal(false);
+      await loadMyAppointments();
+      if (selectedBusinessId) {
+        await loadBusinessAppointments(selectedBusinessId);
+      }
+      setMessage('Appointment updated successfully.');
+    } catch (error) {
+      showError(error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const renderPaymentStatus = (appointment: Appointment | any) => {
+    const payment = paymentsByAppointment[appointment.id];
+    if (payment === undefined) return <span className="text-xs text-slate-400">Checking...</span>;
+    if (!payment) return <span className="text-xs text-slate-500">Not started</span>;
+
+    const styles = payment.status === 'paid'
+      ? 'bg-emerald-50 text-emerald-700'
+      : payment.status === 'failed'
+        ? 'bg-red-50 text-red-700'
+        : 'bg-amber-50 text-amber-700';
+
+    return <span className={`inline-flex rounded-full px-2.5 py-1 text-xs font-semibold capitalize ${styles}`}>{payment.status} {payment.amount ? `- ${centsToMoney(payment.amount)}` : ''}</span>;
+  };
+
   if (!user) {
     return (
       <main className="flex min-h-screen items-center justify-center bg-slate-100 p-4">
+        {toast && (
+          <div className={`fixed right-4 top-4 z-50 rounded-xl border px-4 py-3 text-sm font-medium shadow-lg ${toast.type === 'success' ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-red-200 bg-red-50 text-red-800'}`}>
+            {toast.text}
+          </div>
+        )}
         <Card className="w-full max-w-md">
           <div className="mb-6 text-center">
             <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-2xl bg-slate-900 text-white"><Calendar /></div>
@@ -561,8 +796,43 @@ export default function App() {
     );
   }
 
+  if (paymentRoute) {
+    const isSuccess = paymentRoute === '/payment/success';
+    const appointmentId = new URLSearchParams(window.location.search).get('appointment_id');
+
+    return (
+      <main className="flex min-h-screen items-center justify-center bg-slate-100 p-4">
+        <Card className="w-full max-w-lg">
+          <div className="mb-5 flex h-12 w-12 items-center justify-center rounded-2xl bg-slate-900 text-white">
+            {isSuccess ? <Check size={24} /> : <X size={24} />}
+          </div>
+          <h1 className="text-2xl font-bold text-slate-900">{isSuccess ? 'Payment Successful' : 'Payment Cancelled'}</h1>
+          <p className="mt-2 text-sm text-slate-500">
+            {isSuccess
+              ? 'Stripe returned successfully. The backend is checking Stripe and updating your payment record.'
+              : 'Checkout was cancelled. Your appointment is still available to pay from the appointments list.'}
+          </p>
+          {appointmentId && (
+            <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 p-3 text-sm text-slate-700">
+              Appointment ID: {appointmentId}
+            </div>
+          )}
+          <div className="mt-5 flex flex-wrap gap-2">
+            <Button onClick={returnFromPaymentPage}><Receipt size={16} />Back to homepage</Button>
+            {appointmentId && <Button variant="secondary" onClick={() => loadPaymentStatus(appointmentId).then(() => setMessage('Payment status refreshed.')).catch(showError)}><RefreshCw size={16} />Refresh Status</Button>}
+          </div>
+        </Card>
+      </main>
+    );
+  }
+
   return (
     <main className="min-h-screen bg-slate-100 p-4 md:p-8">
+      {toast && (
+        <div className={`fixed right-4 top-4 z-50 rounded-xl border px-4 py-3 text-sm font-medium shadow-lg ${toast.type === 'success' ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-red-200 bg-red-50 text-red-800'}`}>
+          {toast.text}
+        </div>
+      )}
       <div className="mx-auto max-w-6xl space-y-5">
         <header className="flex flex-col gap-3 rounded-2xl bg-slate-900 p-5 text-white md:flex-row md:items-center md:justify-between">
           <div><h1 className="text-2xl font-bold">BookEase API Integrated</h1><p className="text-sm text-slate-300">Logged in as {user.email} · role: {user.role}</p></div>
@@ -616,9 +886,19 @@ export default function App() {
                 <option value="">Select service</option>
                 {services.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
               </Select>
+              {isBusinessUser && (
+                <Select value={bookingForm.walk_in_customer_id} onChange={(e: any) => setBookingForm({ ...bookingForm, walk_in_customer_id: e.target.value })}>
+                  {/* <option value="">Book for myself</option> */}
+                  {customers.map((customer) => (
+                    <option key={customer.id} value={customer.id}>
+                      {customer.name}{customer.email ? ` - ${customer.email}` : ' - no email'}
+                    </option>
+                  ))}
+                </Select>
+              )}
               <div className="flex gap-2">
                 <Input className="booking-date-time-input" type="datetime-local" value={bookingForm.start_time} onChange={(e: any) => setBookingForm({ ...bookingForm, start_time: e.target.value })} required />
-                <Button variant="secondary" onClick={loadAvailableSlots} disabled={slotsLoading || !bookingForm.service_id} className="shrink-0 px-3" title="Load available slots">
+                <Button variant="secondary" onClick={() => loadAvailableSlots()} disabled={slotsLoading || !bookingForm.service_id} className="shrink-0 px-3" title="Load available slots">
                   <Calendar size={16} />
                 </Button>
               </div>
@@ -647,6 +927,9 @@ export default function App() {
                 </div>
               )}
               {slotsLoading && <p className="text-sm text-slate-500">Loading available slots...</p>}
+              {isBusinessUser && bookingForm.walk_in_customer_id && !customers.find((customer) => customer.id === bookingForm.walk_in_customer_id)?.email && (
+                <p className="text-sm text-amber-700">Add an email for this customer before creating a Stripe payment link.</p>
+              )}
               <Button type="submit" disabled={loading || !bookingForm.service_id}>Book</Button>
             </form>
           </Card>
@@ -654,7 +937,7 @@ export default function App() {
 
         {isBusinessUser && selectedBusinessId && <Card>
           <h2 className="mb-4 text-lg font-semibold">Add Service for Selected Business</h2>
-          <form className="space-y-3 md:space-y-0 md:grid md:gap-3 md:grid-cols-5 md:items-end" onSubmit={createService}>
+          <form className="space-y-3 md:space-y-0 md:grid md:gap-3 md:grid-cols-6 md:items-end" onSubmit={createService}>
             <label className="block text-sm font-medium text-slate-700">
               Name
               <Input className="mt-1" placeholder="Name" value={serviceForm.name} onChange={(e: any) => setServiceForm({ ...serviceForm, name: e.target.value })} required />
@@ -670,6 +953,10 @@ export default function App() {
             <label className="block text-sm font-medium text-slate-700">
               Price
               <Input className="mt-1" type="number" placeholder="Price" value={serviceForm.price} onChange={(e: any) => setServiceForm({ ...serviceForm, price: e.target.value })} required />
+            </label>
+            <label className="flex items-center gap-2 rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700">
+              <input type="checkbox" checked={serviceForm.requires_deposit} onChange={(e: any) => setServiceForm({ ...serviceForm, requires_deposit: e.target.checked })} />
+              Deposit
             </label>
             <Button type="submit" disabled={loading} className="w-full md:w-auto">Add Service</Button>
           </form>
@@ -815,13 +1102,15 @@ export default function App() {
               </select>
             </div>
             <div className="overflow-x-auto rounded-xl border border-slate-200">
-              <table className="w-full min-w-[560px] text-left text-sm">
+              <table className="w-full min-w-[760px] text-left text-sm">
                 <thead className="bg-slate-50 text-xs uppercase text-slate-500">
                   <tr>
                     <th className="px-3 py-2 font-semibold">Date</th>
                     <th className="px-3 py-2 font-semibold">Service name</th>
                     <th className="px-3 py-2 font-semibold">Appointment time</th>
                     <th className="px-3 py-2 font-semibold">Current status</th>
+                    <th className="px-3 py-2 font-semibold">Payment</th>
+                    <th className="px-3 py-2 text-right font-semibold">Actions</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-200">
@@ -832,6 +1121,22 @@ export default function App() {
                       <td className="px-3 py-3 text-slate-700">{formatTime(a.start_time)} - {formatTime(a.end_time)}</td>
                       <td className="px-3 py-3">
                         <span className="inline-flex rounded-full bg-slate-100 px-2.5 py-1 text-xs font-semibold capitalize text-slate-700">{a.status}</span>
+                      </td>
+                      <td className="px-3 py-3">{renderPaymentStatus(a)}</td>
+                      <td className="px-3 py-3">
+                        <div className="flex justify-end gap-2">
+                          <Button variant="secondary" onClick={() => viewAppointment(a.id)} className="px-3"><Eye size={14} /></Button>
+                          {a.status === 'pending' && (
+                            <Button variant="secondary" onClick={() => editAppointment(a.id)} className="px-3" title="Reschedule appointment">
+                              <Pencil size={14} />
+                            </Button>
+                          )}
+                          {a.status === 'pending' && paymentsByAppointment[a.id]?.status !== 'paid' && (
+                            <Button onClick={() => startCheckout(a, !isBusinessUser)} disabled={paymentLoadingId === a.id} className="px-3">
+                              <CreditCard size={14} />Checkout
+                            </Button>
+                          )}
+                        </div>
                       </td>
                     </tr>
                   ))}
@@ -862,6 +1167,7 @@ export default function App() {
                   <tr>
                     <th className="px-3 py-2 font-semibold">Date</th>
                     <th className="px-3 py-2 font-semibold">Service name</th>
+                    <th className="px-3 py-2 font-semibold">User email</th>
                     <th className="px-3 py-2 font-semibold">Appointment time</th>
                     <th className="px-3 py-2 font-semibold">Current status</th>
                     {/* <th className="px-3 py-2 font-semibold">Actions</th> */}
@@ -872,6 +1178,7 @@ export default function App() {
                     <tr key={a.id} className="bg-white align-top">
                       <td className="px-3 py-3 text-slate-700">{formatDate(a.start_time)}</td>
                       <td className="px-3 py-3 font-medium text-slate-900">{getServiceName(a.service_id)}</td>
+                      <td className="px-3 py-3 text-slate-700">{a.walk_in_customer?.name || a.user?.email || '-'}</td>
                       <td className="px-3 py-3 text-slate-700">{formatTime(a.start_time)} - {formatTime(a.end_time)}</td>
                       <td className="px-3 py-3">
                         <span className="inline-flex rounded-full bg-slate-100 px-2.5 py-1 text-xs font-semibold capitalize text-slate-700">{a.status}</span>
@@ -897,43 +1204,145 @@ export default function App() {
           <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
             <Card className="w-full max-w-md">
               <div className="flex justify-between items-center mb-4">
-                <h2 className="text-lg font-semibold">Appointment Details</h2>
-                <button onClick={() => { setShowAppointmentModal(false); setSelectedAppointment(null); }} className="text-slate-400 hover:text-slate-600">✕</button>
+                <h2 className="text-lg font-semibold">{isEditingAppointment ? 'Reschedule Appointment' : 'Appointment Details'}</h2>
+                <button onClick={closeAppointmentModal} className="text-slate-400 hover:text-slate-600">✕</button>
               </div>
-              <div className="space-y-3 text-sm">
-                <div className="flex justify-between">
-                  <span className="text-slate-500">Status:</span>
-                  <span className="font-medium capitalize">{selectedAppointment.status}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-slate-500">Service Name:</span>
-                  <span className="font-medium">{selectedAppointment.service?.name || getServiceName(selectedAppointment.service_id)}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-slate-500">Business Name:</span>
-                  <span className="font-medium">{selectedAppointment.business?.name || getBusinessName(selectedAppointment.business_id)}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-slate-500">Start Time:</span>
-                  <span className="font-medium">{formatDateTime(selectedAppointment.start_time)}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-slate-500">End Time:</span>
-                  <span className="font-medium">{formatDateTime(selectedAppointment.end_time)}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-slate-500">User email:</span>
-                  <span className="font-medium">{getAppointmentUserName(selectedAppointment)}</span>
-                </div>
-              </div>
-              <div className="mt-4 flex gap-2">
-                {selectedAppointment.status === 'pending' && (
-                  <Button onClick={() => confirmAppointment(selectedAppointment.id)} disabled={loading}>
-                    Confirm
-                  </Button>
-                )}
-                <Button onClick={() => setShowAppointmentModal(false)}>Close</Button>
-              </div>
+              {isEditingAppointment ? (
+                <form className="space-y-4" onSubmit={saveAppointmentUpdate}>
+                  <div className="space-y-3 text-sm">
+                    <div className="flex justify-between">
+                      <span className="text-slate-500">Status:</span>
+                      <span className="font-medium capitalize">{selectedAppointment.status}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-500">Service Name:</span>
+                      <span className="font-medium">{selectedAppointment.service?.name || getServiceName(selectedAppointment.service_id)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-500">Business Name:</span>
+                      <span className="font-medium">{selectedAppointment.business?.name || getBusinessName(selectedAppointment.business_id)}</span>
+                    </div>
+                  </div>
+                  <div className="space-y-2">
+                    <label className="block text-sm font-medium text-slate-700">
+                      New Appointment Time
+                      <div className="mt-1 flex gap-2">
+                        {/* <Input
+                          className="flex-1"
+                          type="datetime-local"
+                          value={appointmentUpdateForm.start_time}
+                          onChange={(e: any) => setAppointmentUpdateForm({ start_time: e.target.value })}
+                          required
+                        /> */}
+                        <Button
+                          type="button"
+                          variant="secondary"
+                          className="shrink-0 px-3"
+                          title="Show available slots"
+                          onClick={() => loadAvailableSlots(selectedAppointment.service_id, appointmentUpdateForm.start_time?.slice(0, 10), 'appointment')}
+                          disabled={appointmentSlotsLoading}
+                        >
+                          <Calendar size={16} />
+                        </Button>
+                      </div>
+                    </label>
+                    {!!appointmentAvailableDays.length && (
+                      <div className="max-h-52 overflow-y-auto rounded-xl border border-slate-200 p-3">
+                        <p className="mb-2 text-sm font-semibold text-slate-700">Available slots</p>
+                        <div className="space-y-3">
+                          {appointmentAvailableDays.map((day) => (
+                            <div key={day.date}>
+                              <p className="mb-2 text-xs font-semibold uppercase text-slate-500">{formatDate(day.date)}</p>
+                              <div className="flex flex-wrap gap-2">
+                                {day.available_slots.map((slot) => (
+                                  <button
+                                    key={slot}
+                                    type="button"
+                                    onClick={() => selectAppointmentSlot(slot)}
+                                    className={`rounded-lg border px-3 py-1.5 text-sm font-medium ${appointmentUpdateForm.start_time === slot.slice(0, 16)
+                                      ? 'border-slate-900 bg-slate-900 text-white'
+                                      : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                                    }`}
+                                  >
+                                    {formatTime(slot)}
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    {appointmentSlotsLoading && <p className="text-sm text-slate-500">Loading available slots...</p>}
+                  </div>
+                  <div className="flex gap-2">
+                    <Button type="submit" disabled={loading}>
+                      <Save size={16} />Save Changes
+                    </Button>
+                    <Button type="button" variant="secondary" onClick={closeAppointmentModal}>
+                      Cancel
+                    </Button>
+                  </div>
+                </form>
+              ) : (
+                <>
+                  <div className="space-y-3 text-sm">
+                    <div className="flex justify-between">
+                      <span className="text-slate-500">Status:</span>
+                      <span className="font-medium capitalize">{selectedAppointment.status}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-500">Service Name:</span>
+                      <span className="font-medium">{selectedAppointment.service?.name || getServiceName(selectedAppointment.service_id)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-500">Business Name:</span>
+                      <span className="font-medium">{selectedAppointment.business?.name || getBusinessName(selectedAppointment.business_id)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-500">Start Time:</span>
+                      <span className="font-medium">{formatDateTime(selectedAppointment.start_time)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-500">End Time:</span>
+                      <span className="font-medium">{formatDateTime(selectedAppointment.end_time)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-500">User email:</span>
+                      <span className="font-medium">{getAppointmentUserName(selectedAppointment)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-slate-500">Payment:</span>
+                      <span className="font-medium">{renderPaymentStatus(selectedAppointment)}</span>
+                    </div>
+                    {paymentsByAppointment[selectedAppointment.id]?.stripe_payment_intent && (
+                      <div className="flex justify-between gap-3">
+                        <span className="text-slate-500">Stripe intent:</span>
+                        <span className="max-w-[220px] truncate font-medium">{paymentsByAppointment[selectedAppointment.id]?.stripe_payment_intent}</span>
+                      </div>
+                    )}
+                    {checkoutLink && (
+                      <div className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+                        <p className="mb-1 text-slate-500">Payment link:</p>
+                        <a className="break-all font-medium text-slate-900 underline" href={checkoutLink} target="_blank" rel="noreferrer">{checkoutLink}</a>
+                      </div>
+                    )}
+                  </div>
+                  <div className="mt-4 flex gap-2">
+                    {selectedAppointment.status === 'pending' && !selectedAppointment.service?.requires_deposit && (
+                      <Button onClick={() => confirmAppointment(selectedAppointment.id)} disabled={loading}>
+                        Confirm
+                      </Button>
+                    )}
+                    {selectedAppointment.status === 'pending' && paymentsByAppointment[selectedAppointment.id]?.status !== 'paid' && (
+                      <Button onClick={() => startCheckout(selectedAppointment, !isBusinessUser)} disabled={paymentLoadingId === selectedAppointment.id}>
+                        <CreditCard size={16} />Checkout
+                      </Button>
+                    )}
+                    <Button onClick={closeAppointmentModal}>Close</Button>
+                  </div>
+                </>
+              )}
             </Card>
           </div>
         )}

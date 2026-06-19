@@ -1,0 +1,36 @@
+# Local environment and secrets
+.env
+.env.*
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Node artifacts
+node_modules/
+
+# Build outputs and runtime files
+dist/
+celerybeat-schedule.*
+dump.rdb
+*.bak
+*.dat
+*.dir
+
+# IDE and editor files
+.vscode/
+.sixth/
+.kilo/
+.idea/
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
